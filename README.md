@@ -2,6 +2,12 @@
 
 Run custom GGUF language models locally on iPad and iPhone. Serve them through an OpenAI-compatible HTTP API. No cloud, no subscription, no data leaves your device.
 
+> **This fork** takes long prompts (instructions plus a transcript), for [ReelIQ](https://github.com/rkstlohchab/ReelIQ):
+> - the context holds 16K tokens on iPads with 12 GB of memory or more, 8K below that (it was 1,024), and `max_tokens` counts from the end of the prompt;
+> - the prompt is read 512 tokens at a time, so prompts longer than one batch work;
+> - the server reads the whole request by its `Content-Length` (it read only the first piece);
+> - `temperature` is honoured (0 is greedy), answers report `usage` and `finish_reason: "length"` when cut off, a prompt too long for the context gets a 400 saying so, and requests take turns.
+
 ## Features
 
 - **Local inference** — runs GGUF models on-device with Metal GPU acceleration via llama.cpp

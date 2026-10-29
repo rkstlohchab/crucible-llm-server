@@ -55,15 +55,44 @@ class HTTPServer {
         return address
     }
 
+    // A long prompt (instructions and a transcript) is tens of kilobytes; more than this is refused.
+    private static let maxRequestBytes = 8 * 1024 * 1024
+
     private func handleConnection(_ connection: NWConnection) {
         connection.start(queue: .global(qos: .userInitiated))
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, _, error in
-            guard let self = self, let data = data, error == nil else {
+        receiveRequest(connection, buffer: Data())
+    }
+
+    /// Reads until the headers and the whole body (by its Content-Length) are in: a long request arrives in many pieces,
+    /// and one read returns only the first.
+    private func receiveRequest(_ connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+            guard let self = self, error == nil else {
                 connection.cancel()
                 return
             }
-            let request = String(data: data, encoding: .utf8) ?? ""
-            self.routeRequest(request, connection: connection)
+            var buffer = buffer
+            if let data { buffer.append(data) }
+            if let headerEnd = buffer.range(of: Data("\r\n\r\n".utf8)) {
+                let head = String(decoding: buffer[..<headerEnd.lowerBound], as: UTF8.self)
+                let length = head.components(separatedBy: "\r\n").compactMap { line -> Int? in
+                    let parts = line.split(separator: ":", maxSplits: 1)
+                    guard parts.count == 2, parts[0].trimmingCharacters(in: .whitespaces).lowercased() == "content-length" else { return nil }
+                    return Int(parts[1].trimmingCharacters(in: .whitespaces))
+                }.first ?? 0
+                if length > HTTPServer.maxRequestBytes {
+                    self.sendResponse(connection: connection, status: "413 Payload Too Large", body: "{\"error\":\"Request too large\"}", contentType: "application/json")
+                    return
+                }
+                if buffer.count - headerEnd.upperBound >= length || isComplete {
+                    self.routeRequest(String(decoding: buffer, as: UTF8.self), connection: connection)
+                    return
+                }
+            } else if buffer.count > 65536 || isComplete {
+                self.sendResponse(connection: connection, status: "400 Bad Request", body: "{\"error\":\"Bad Request\"}", contentType: "application/json")
+                return
+            }
+            self.receiveRequest(connection, buffer: buffer)
         }
     }
 
@@ -146,6 +175,7 @@ class HTTPServer {
         prompt += "<|im_start|>assistant\n"
 
         let maxTokens = json["max_tokens"] as? Int ?? 500
+        let temperature = (json["temperature"] as? NSNumber)?.floatValue ?? 0.4
 
         // Run inference on a background thread
         Task {
@@ -155,7 +185,12 @@ class HTTPServer {
                 return
             }
 
-            let result = await llamaState.completeForAPI(text: prompt, maxTokens: maxTokens)
+            let result = await llamaState.completeForAPI(text: prompt, maxTokens: maxTokens, temperature: temperature)
+            if let why = result.error {
+                let body = (try? JSONSerialization.data(withJSONObject: ["error": ["message": why]])).flatMap { String(data: $0, encoding: .utf8) } ?? "{\"error\":\"Completion failed\"}"
+                self.sendResponse(connection: connection, status: "400 Bad Request", body: body, contentType: "application/json")
+                return
+            }
 
             let responseJSON: [String: Any] = [
                 "id": "chatcmpl-\(UUID().uuidString.prefix(8))",
@@ -166,10 +201,15 @@ class HTTPServer {
                     "index": 0,
                     "message": [
                         "role": "assistant",
-                        "content": result
+                        "content": result.text
                     ],
-                    "finish_reason": "stop"
-                ]]
+                    "finish_reason": result.finishReason
+                ]],
+                "usage": [
+                    "prompt_tokens": result.promptTokens,
+                    "completion_tokens": result.completionTokens,
+                    "total_tokens": result.promptTokens + result.completionTokens
+                ]
             ]
 
             if let jsonData = try? JSONSerialization.data(withJSONObject: responseJSON),

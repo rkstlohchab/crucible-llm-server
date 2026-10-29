@@ -35,6 +35,8 @@ actor LlamaContext {
 
     var n_len: Int32 = 1024
     var n_cur: Int32 = 0
+    var n_prompt: Int32 = 0
+    var hit_limit: Bool = false // generation stopped at n_len, not at an end-of-generation token
 
     var n_decode: Int32 = 0
 
@@ -59,6 +61,10 @@ actor LlamaContext {
         llama_backend_free()
     }
 
+    /// The context window: prompt and answer together. 16K tokens on iPads with 12 GB of memory or more, 8K below that,
+    /// so a 9B model's weights keep their room. A prompt of a few thousand tokens (instructions and a transcript) fits.
+    static let contextSize: UInt32 = ProcessInfo.processInfo.physicalMemory >= 12 * 1024 * 1024 * 1024 ? 16384 : 8192
+
     static func create_context(path: String) throws -> LlamaContext {
         llama_backend_init()
         var model_params = llama_model_default_params()
@@ -77,7 +83,7 @@ actor LlamaContext {
         print("Using \(n_threads) threads")
 
         var ctx_params = llama_context_default_params()
-        ctx_params.n_ctx = 1024  // reduced from 2048 to lower KV cache memory on iPad
+        ctx_params.n_ctx = LlamaContext.contextSize
         ctx_params.n_threads       = Int32(n_threads)
         ctx_params.n_threads_batch = Int32(n_threads)
 
@@ -114,39 +120,54 @@ actor LlamaContext {
         return batch.n_tokens;
     }
 
-    func completion_init(text: String) {
-        print("attempting to complete \"\(text)\"")
+    /// Greedy at temperature 0 (the same answer every time, which JSON extraction wants); sampled above it.
+    func set_temperature(_ temperature: Float) {
+        llama_sampler_free(sampling)
+        sampling = llama_sampler_chain_init(llama_sampler_chain_default_params())
+        if temperature <= 0 {
+            llama_sampler_chain_add(sampling, llama_sampler_init_greedy())
+        } else {
+            llama_sampler_chain_add(sampling, llama_sampler_init_temp(temperature))
+            llama_sampler_chain_add(sampling, llama_sampler_init_dist(1234))
+        }
+    }
 
+    /// Reads the prompt into the context 512 tokens at a time (the batch's size), and lets generation run `max_tokens`
+    /// past it, within the context. Returns why it can't start, or nil.
+    @discardableResult
+    func completion_init(text: String, max_tokens: Int32 = 1024) -> String? {
         is_done = false
+        hit_limit = false
         tokens_list = tokenize(text: text, add_bos: true)
         temporary_invalid_cchars = []
 
-        let n_ctx = llama_n_ctx(context)
-        let n_kv_req = tokens_list.count + (Int(n_len) - tokens_list.count)
+        let n_ctx = Int32(llama_n_ctx(context))
+        n_prompt = Int32(tokens_list.count)
+        if n_prompt + 16 > n_ctx {
+            is_done = true
+            return "The prompt is \(n_prompt) tokens; this iPad's context holds \(n_ctx)."
+        }
+        n_len = min(n_ctx, n_prompt + max_tokens)
 
-        print("\n n_len = \(n_len), n_ctx = \(n_ctx), n_kv_req = \(n_kv_req)")
-
-        if n_kv_req > n_ctx {
-            print("error: n_kv_req > n_ctx, the required KV cache size is not big enough")
+        var start = 0
+        while start < tokens_list.count {
+            let end = min(start + 512, tokens_list.count)
+            llama_batch_clear(&batch)
+            for i in start..<end {
+                llama_batch_add(&batch, tokens_list[i], Int32(i), [0], false)
+            }
+            if end == tokens_list.count {
+                batch.logits[Int(batch.n_tokens) - 1] = 1 // the next token is sampled from the prompt's last
+            }
+            if llama_decode(context, batch) != 0 {
+                is_done = true
+                return "llama_decode() failed while reading the prompt"
+            }
+            start = end
         }
 
-        for id in tokens_list {
-            print(String(cString: token_to_piece(token: id) + [0]))
-        }
-
-        llama_batch_clear(&batch)
-
-        for i1 in 0..<tokens_list.count {
-            let i = Int(i1)
-            llama_batch_add(&batch, tokens_list[i], Int32(i), [0], false)
-        }
-        batch.logits[Int(batch.n_tokens) - 1] = 1 // true
-
-        if llama_decode(context, batch) != 0 {
-            print("llama_decode() failed")
-        }
-
-        n_cur = batch.n_tokens
+        n_cur = n_prompt
+        return nil
     }
 
     func completion_loop() -> String {
@@ -157,6 +178,7 @@ actor LlamaContext {
         if llama_vocab_is_eog(vocab, new_token_id) || n_cur == n_len {
             print("\n")
             is_done = true
+            hit_limit = n_cur == n_len
             let new_token_str = String(cString: temporary_invalid_cchars + [0])
             temporary_invalid_cchars.removeAll()
             return new_token_str

@@ -229,13 +229,35 @@ class LlamaState: ObservableObject {
         }
     }
 
-    // Non-streaming completion for API use
-    func completeForAPI(text: String, maxTokens: Int = 500) async -> String {
-        guard let llamaContext else {
-            return "Error: No model loaded"
-        }
+    /// One API answer: its text, how long the prompt and answer were, and whether it stopped at the length limit.
+    struct APICompletion {
+        var text: String = ""
+        var promptTokens: Int = 0
+        var completionTokens: Int = 0
+        var finishReason: String = "stop"
+        var error: String? = nil
+    }
 
-        await llamaContext.completion_init(text: text)
+    // Requests take turns: two completions interleaving on one context would corrupt both.
+    private let apiGate = APIGate()
+
+    // Non-streaming completion for API use
+    func completeForAPI(text: String, maxTokens: Int = 500, temperature: Float = 0.4) async -> APICompletion {
+        guard let llamaContext else {
+            return APICompletion(error: "No model loaded")
+        }
+        await apiGate.enter()
+        let answer = await runCompletion(on: llamaContext, text: text, maxTokens: maxTokens, temperature: temperature)
+        await apiGate.leave()
+        return answer
+    }
+
+    private func runCompletion(on llamaContext: LlamaContext, text: String, maxTokens: Int, temperature: Float) async -> APICompletion {
+        await llamaContext.set_temperature(temperature)
+        if let why = await llamaContext.completion_init(text: text, max_tokens: Int32(maxTokens)) {
+            await llamaContext.clear()
+            return APICompletion(error: why)
+        }
         var result = ""
         var tokenCount = 0
 
@@ -244,6 +266,8 @@ class LlamaState: ObservableObject {
             result += piece
             tokenCount += 1
         }
+        let promptTokens = Int(await llamaContext.n_prompt)
+        let hitLimit = await llamaContext.hit_limit
 
         await llamaContext.clear()
 
@@ -264,6 +288,29 @@ class LlamaState: ObservableObject {
             cleaned = String(cleaned[..<endTag.lowerBound])
         }
 
-        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cut = hitLimit || tokenCount >= maxTokens
+        return APICompletion(text: cleaned.trimmingCharacters(in: .whitespacesAndNewlines), promptTokens: promptTokens, completionTokens: tokenCount, finishReason: cut ? "length" : "stop")
+    }
+}
+
+/// A one-at-a-time gate for API completions: `enter` waits while another is running.
+actor APIGate {
+    private var busy = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+
+    func enter() async {
+        if !busy {
+            busy = true
+            return
+        }
+        await withCheckedContinuation { waiting.append($0) }
+    }
+
+    func leave() {
+        if waiting.isEmpty {
+            busy = false
+        } else {
+            waiting.removeFirst().resume()
+        }
     }
 }
