@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 struct Model: Identifiable {
     var id = UUID()
@@ -114,9 +115,27 @@ class LlamaState: ObservableObject {
             filename: "openhermes-2.5-mistral-7b.Q3_K_M.gguf", status: "download"
         )
     ]
+    /// Roughly what a model needs while it answers: its file, plus the context cache and scratch buffers.
+    private static func memoryNeeded(for modelUrl: URL) -> UInt64 {
+        let size = (try? FileManager.default.attributesOfItem(atPath: modelUrl.path())[.size] as? NSNumber)?.uint64Value ?? 0
+        return size + 600 * 1024 * 1024
+    }
+
+    private static func gb(_ bytes: UInt64) -> String { String(format: "%.1f GB", Double(bytes) / 1_073_741_824) }
+
     func loadModel(modelUrl: URL?) throws {
         if let modelUrl {
-            messageLog += "Loading model...\n"
+            // The old model goes first: holding two at once is how a switch runs out of memory.
+            llamaContext = nil
+            // iPadOS closes an app that goes over its memory limit, and a model only takes its full size once it answers.
+            // So say it now, in numbers, rather than crash on the first message.
+            let needed = LlamaState.memoryNeeded(for: modelUrl)
+            let allowed = UInt64(os_proc_available_memory())
+            if allowed > 0 && needed > allowed {
+                messageLog += "Not loaded: \(modelUrl.lastPathComponent) needs about \(LlamaState.gb(needed)), and iPadOS lets this app use \(LlamaState.gb(allowed)) right now. Pick a smaller model (a Q3 version, or a 4B model), or close other apps and try again.\n"
+                return
+            }
+            messageLog += "Loading model (needs about \(LlamaState.gb(needed)) of the \(LlamaState.gb(allowed)) this app may use)...\n"
             llamaContext = try LlamaContext.create_context(path: modelUrl.path())
             messageLog += "Loaded model \(modelUrl.lastPathComponent)\n"
 

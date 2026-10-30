@@ -118,6 +118,9 @@ struct ContentView: View {
                         InputButton(llamaState: llamaState)
                     }
                 }
+                Section(header: Text("Or a GGUF file on this iPad (AirDrop it to Files)")) {
+                    LoadCustomButton(llamaState: llamaState)
+                }
                 Section(header: Text("Downloaded Models")) {
                     ForEach(llamaState.downloadedModels) { model in
                         DownloadButton(llamaState: llamaState, modelName: model.name, modelUrl: model.url, filename: model.filename)

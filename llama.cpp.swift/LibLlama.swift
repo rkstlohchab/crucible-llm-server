@@ -84,6 +84,12 @@ actor LlamaContext {
 
         var ctx_params = llama_context_default_params()
         ctx_params.n_ctx = LlamaContext.contextSize
+        // Memory is what an iPad runs out of: flash attention lets the context cache be 8-bit (about half the size), and
+        // smaller physical batches shrink the scratch buffers. iPadOS closes the app outright when it goes over its limit.
+        ctx_params.n_ubatch = 256
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED
+        ctx_params.type_k = GGML_TYPE_Q8_0
+        ctx_params.type_v = GGML_TYPE_Q8_0
         ctx_params.n_threads       = Int32(n_threads)
         ctx_params.n_threads_batch = Int32(n_threads)
 
