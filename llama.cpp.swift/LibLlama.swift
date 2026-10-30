@@ -65,7 +65,10 @@ actor LlamaContext {
     /// so a 9B model's weights keep their room. A prompt of a few thousand tokens (instructions and a transcript) fits.
     static let contextSize: UInt32 = ProcessInfo.processInfo.physicalMemory >= 12 * 1024 * 1024 * 1024 ? 16384 : 8192
 
-    static func create_context(path: String) throws -> LlamaContext {
+    /// `onGPU` false runs the model on the CPU, straight from its mapped file: iPadOS can drop those pages and read them
+    /// again, so they don't count against the app's memory limit the way GPU buffers do. Slower, but a model bigger than
+    /// the limit runs. Nothing is repacked or copied into the app's own memory, and no work is handed to the GPU.
+    static func create_context(path: String, onGPU: Bool = true) throws -> LlamaContext {
         llama_backend_init()
         var model_params = llama_model_default_params()
 
@@ -73,6 +76,13 @@ actor LlamaContext {
         model_params.n_gpu_layers = 0
         print("Running on simulator, force use n_gpu_layers = 0")
 #endif
+        if !onGPU {
+            model_params.n_gpu_layers = 0
+            model_params.use_mmap = true
+            model_params.use_direct_io = false
+            model_params.use_mlock = false
+            model_params.use_extra_bufts = false
+        }
         let model = llama_model_load_from_file(path, model_params)
         guard let model else {
             print("Could not load model at \(path)")
@@ -90,6 +100,7 @@ actor LlamaContext {
         ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED
         ctx_params.type_k = GGML_TYPE_Q8_0
         ctx_params.type_v = GGML_TYPE_Q8_0
+        ctx_params.op_offload = onGPU
         ctx_params.n_threads       = Int32(n_threads)
         ctx_params.n_threads_batch = Int32(n_threads)
 

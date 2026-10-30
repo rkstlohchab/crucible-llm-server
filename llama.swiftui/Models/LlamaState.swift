@@ -115,11 +115,12 @@ class LlamaState: ObservableObject {
             filename: "openhermes-2.5-mistral-7b.Q3_K_M.gguf", status: "download"
         )
     ]
-    /// Roughly what a model needs while it answers: its file, plus the context cache and scratch buffers.
-    private static func memoryNeeded(for modelUrl: URL) -> UInt64 {
-        let size = (try? FileManager.default.attributesOfItem(atPath: modelUrl.path())[.size] as? NSNumber)?.uint64Value ?? 0
-        return size + 600 * 1024 * 1024
+    /// The model file's size, and roughly what it needs beside it while it answers (context cache, scratch buffers).
+    private static func modelSize(_ modelUrl: URL) -> UInt64 {
+        (try? FileManager.default.attributesOfItem(atPath: modelUrl.path())[.size] as? NSNumber)?.uint64Value ?? 0
     }
+    private static let working: UInt64 = 600 * 1024 * 1024
+    private static let headroom: UInt64 = 1024 * 1024 * 1024
 
     private static func gb(_ bytes: UInt64) -> String { String(format: "%.1f GB", Double(bytes) / 1_073_741_824) }
 
@@ -127,16 +128,20 @@ class LlamaState: ObservableObject {
         if let modelUrl {
             // The old model goes first: holding two at once is how a switch runs out of memory.
             llamaContext = nil
-            // iPadOS closes an app that goes over its memory limit, and a model only takes its full size once it answers.
-            // So say it now, in numbers, rather than crash on the first message.
-            let needed = LlamaState.memoryNeeded(for: modelUrl)
+            // iPadOS closes an app that goes over its memory limit, and on the GPU the whole model counts against it once it
+            // answers. A model that fits with a gigabyte to spare runs there; a bigger one runs on the CPU from its file,
+            // which doesn't count, so only the context cache and buffers have to fit.
+            let size = LlamaState.modelSize(modelUrl)
             let allowed = UInt64(os_proc_available_memory())
-            if allowed > 0 && needed > allowed {
-                messageLog += "Not loaded: \(modelUrl.lastPathComponent) needs about \(LlamaState.gb(needed)), and iPadOS lets this app use \(LlamaState.gb(allowed)) right now. Pick a smaller model (a Q3 version, or a 4B model), or close other apps and try again.\n"
+            let onGPU = allowed == 0 || size + LlamaState.working + LlamaState.headroom <= allowed
+            if !onGPU && LlamaState.working > allowed {
+                messageLog += "Not loaded: iPadOS lets this app use only \(LlamaState.gb(allowed)) right now. Close other apps and try again.\n"
                 return
             }
-            messageLog += "Loading model (needs about \(LlamaState.gb(needed)) of the \(LlamaState.gb(allowed)) this app may use)...\n"
-            llamaContext = try LlamaContext.create_context(path: modelUrl.path())
+            messageLog += onGPU
+                ? "Loading model on the GPU (needs about \(LlamaState.gb(size + LlamaState.working)) of the \(LlamaState.gb(allowed)) this app may use)...\n"
+                : "Too big for the GPU here (about \(LlamaState.gb(size + LlamaState.working)) of \(LlamaState.gb(allowed))): running it on the CPU, read from its file as needed. Slower, but within iPadOS's limit...\n"
+            llamaContext = try LlamaContext.create_context(path: modelUrl.path(), onGPU: onGPU)
             messageLog += "Loaded model \(modelUrl.lastPathComponent)\n"
 
             // Assuming that the model is successfully loaded, update the downloaded models
